@@ -1,0 +1,9 @@
+,count
+Total records,601
+Missing transaction IDs,0
+Missing agent IDs,0
+Missing transaction types,0
+Missing transaction dates,0
+Invalid amounts,20
+Unknown agents,8
+Suspicious amounts,5

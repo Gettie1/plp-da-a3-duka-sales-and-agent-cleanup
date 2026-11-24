@@ -1,0 +1,14 @@
+# Python environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Raw generated datasets (do not commit)
+duka_sales.csv
+agents.csv
+agent_transactions.csv
