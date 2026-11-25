@@ -18,7 +18,32 @@ def clean_agent_data(txns, agents):
     """
 
     clean_df = txns.copy()
+    agents_df = agents.copy()
     log = []
+
+    # Validate required columns
+    required_txn_columns = [
+        "txn_id", "agent_id", "txn_type", "amount", "txn_date"
+    ]
+    required_agent_columns = ["agent_id", "county"]
+
+    missing_txn = [
+        col for col in required_txn_columns
+        if col not in clean_df.columns
+    ]
+    missing_agents = [
+        col for col in required_agent_columns
+        if col not in agents_df.columns
+    ]
+
+    if missing_txn or missing_agents:
+        raise ValueError(
+            f"Missing transaction columns: {missing_txn}; "
+            f"Missing agent columns: {missing_agents}"
+        )
+
+    if agents_df["agent_id"].duplicated().any():
+        raise ValueError("Agent register contains duplicate agent IDs.")
 
     def record_action(action, rows_affected, details):
         log.append({
@@ -30,6 +55,7 @@ def clean_agent_data(txns, agents):
     # 1. Remove exact duplicate records
     before = len(clean_df)
     clean_df = clean_df.drop_duplicates().copy()
+
     record_action(
         "Remove exact duplicates",
         before - len(clean_df),
@@ -37,17 +63,17 @@ def clean_agent_data(txns, agents):
     )
 
     # 2. Resolve duplicate transaction IDs
-    duplicate_ids = clean_df["txn_id"].duplicated(keep=False)
-    duplicate_count = int(
-    clean_df["txn_id"].duplicated().sum()
-)
+    before = len(clean_df)
 
-    # Keep the record linked to a registered agent
-    valid_agent_ids = set(agents["agent_id"])
-    clean_df["_valid_agent"] = clean_df["agent_id"].isin(valid_agent_ids)
+    valid_agent_ids = set(agents_df["agent_id"])
+
+    clean_df["_valid_agent"] = (
+        clean_df["agent_id"].isin(valid_agent_ids)
+    )
 
     clean_df = (
-        clean_df.sort_values("_valid_agent", ascending=False)
+        clean_df
+        .sort_values("_valid_agent", ascending=False, kind="stable")
         .drop_duplicates(subset="txn_id", keep="first")
         .drop(columns="_valid_agent")
         .copy()
@@ -55,43 +81,49 @@ def clean_agent_data(txns, agents):
 
     record_action(
         "Resolve duplicate transaction IDs",
-        duplicate_count,
+        before - len(clean_df),
         "Retained one record per transaction ID, preferring a registered agent."
     )
 
     # 3. Standardize transaction types
-    clean_df["txn_type"] = (
+    original_types = clean_df["txn_type"].copy()
+
+    standardized_types = (
         clean_df["txn_type"]
         .astype("string")
         .str.strip()
         .str.lower()
+        .map({
+            "deposit": "Deposit",
+            "withdrawal": "Withdrawal"
+        })
     )
 
-    clean_df["txn_type"] = clean_df["txn_type"].map({
-        "deposit": "Deposit",
-        "withdrawal": "Withdrawal"
-    })
+    changed_types = (
+        original_types.astype("string") != standardized_types
+    ).fillna(False)
+
+    clean_df["txn_type"] = standardized_types
 
     record_action(
         "Standardize transaction types",
-        int(clean_df["txn_type"].isna().sum()),
-        "Standardized valid values to Deposit and Withdrawal."
+        changed_types.sum(),
+        "Standardized transaction types to Deposit and Withdrawal."
     )
 
-    # 4. Convert amounts to numeric
-    original_amounts = clean_df["amount"].copy()
-
+    # 4. Convert transaction amounts to numeric
     clean_df["amount"] = pd.to_numeric(
         clean_df["amount"],
         errors="coerce"
     )
 
     missing_amounts = clean_df["amount"].isna()
+    missing_count = missing_amounts.sum()
 
     record_action(
         "Identify missing or invalid amounts",
-        missing_amounts.sum(),
-        "Converted invalid strings and missing values to NaN."
+        missing_count,
+        "Converted invalid amount values and missing values to NaN."
     )
 
     # 5. Impute missing amounts using the median
@@ -99,20 +131,35 @@ def clean_agent_data(txns, agents):
 
     clean_df["amount_imputed"] = missing_amounts
 
-    clean_df["amount"] = clean_df["amount"].fillna(
-        median_amount
-    )
+    if missing_count > 0:
+        if pd.isna(median_amount):
+            raise ValueError(
+                "Cannot impute amounts because all transaction amounts are missing."
+            )
+
+        clean_df["amount"] = clean_df["amount"].fillna(median_amount)
 
     record_action(
         "Impute missing amounts",
-        missing_amounts.sum(),
-        f"Replaced missing amounts with median: {median_amount:.2f}."
+        missing_count,
+        (
+            f"Replaced missing amounts with the median "
+            f"of KES {median_amount:.2f}."
+        )
     )
 
-    # 6. Detect outliers using the IQR method
+    # 6. Detect suspicious KES 250,000 amounts
+    suspicious_count = clean_df["amount"].eq(250000).sum()
+
+    record_action(
+        "Flag suspicious KES 250,000 amounts",
+        suspicious_count,
+        "Retained suspicious amounts for investigation."
+    )
+
+    # 7. Detect outliers using the IQR method
     q1 = clean_df["amount"].quantile(0.25)
     q3 = clean_df["amount"].quantile(0.75)
-
     iqr = q3 - q1
 
     lower_bound = q1 - 1.5 * iqr
@@ -124,25 +171,36 @@ def clean_agent_data(txns, agents):
     )
 
     record_action(
-        "Flag outliers",
+        "Flag statistical outliers",
         clean_df["is_outlier"].sum(),
-        f"IQR bounds: {lower_bound:.2f} to {upper_bound:.2f}."
+        (
+            f"Used IQR bounds of KES {lower_bound:.2f} "
+            f"to KES {upper_bound:.2f}. Outliers were retained."
+        )
     )
 
-    # 7. Standardize transaction dates
+    # 8. Standardize transaction dates
+    original_dates = clean_df["txn_date"].copy()
+
+    normalized_dates = (
+        original_dates.astype("string").str.replace("/", "-", regex=False)
+    )
+
     clean_df["txn_date"] = pd.to_datetime(
-        clean_df["txn_date"],
+        normalized_dates,
         format="mixed",
         errors="coerce"
     )
 
+    invalid_dates = clean_df["txn_date"].isna().sum()
+
     record_action(
-        "Validate transaction dates",
-        clean_df["txn_date"].isna().sum(),
-        "Converted transaction dates to datetime."
+        "Standardize and validate transaction dates",
+        invalid_dates,
+        "Converted valid dates to datetime and standardized slash separators."
     )
 
-    # 8. Identify unknown agents
+    # 9. Identify unknown agents
     clean_df["unknown_agent"] = (
         ~clean_df["agent_id"].isin(valid_agent_ids)
     )
@@ -153,9 +211,9 @@ def clean_agent_data(txns, agents):
         "Flagged transactions referencing unregistered agents."
     )
 
-    # 9. Merge with the agent register
+    # 10. Merge agent information
     clean_df = clean_df.merge(
-        agents[["agent_id", "county"]],
+        agents_df[["agent_id", "county"]],
         on="agent_id",
         how="left",
         validate="many_to_one"
@@ -164,14 +222,21 @@ def clean_agent_data(txns, agents):
     record_action(
         "Merge agent register",
         clean_df["county"].isna().sum(),
-        "Left join used to retain transactions with unknown agents."
+        "Used a left join to retain transactions with unknown agents."
     )
 
-    # 10. Prepare ISO-formatted dates
+    # 11. Format dates as ISO strings
     clean_df["txn_date"] = (
         clean_df["txn_date"].dt.strftime("%Y-%m-%d")
     )
 
-    log = pd.DataFrame(log)
+    record_action(
+        "Format transaction dates",
+        len(clean_df),
+        "Formatted transaction dates as YYYY-MM-DD."
+    )
 
-    return clean_df, log
+    # Return cleaned data and audit log
+    cleaning_log = pd.DataFrame(log)
+
+    return clean_df, cleaning_log
